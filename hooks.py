@@ -1,36 +1,38 @@
 import json
 import os
+import re
 import urllib
+from mercurial.ui import ui
 
 hookDirectory = os.path.dirname(os.path.abspath(__file__))
 cacheFilePath = hookDirectory + "/HacknPlan_HookCache.json"
 secretsFilePath = hookDirectory + "/HacknPlan_Settings.json"
 
-apiKey = None
-projectId = None
-commentHeader = None
-commitTableRowFormat = None
-mercurialUI = None
+TASK_REGEX = re.compile(r'(?:\W|^)#(?P<issue>\d+)\b')
+
+
+def PrintErrorMsg(ui, msg):
+    ui.write((msg + "\n").encode("utf-8"))
+# end def
+
+
+try:
+    secrets = json.load(open(secretsFilePath))
+except (IOError, ValueError) as ex:
+    PrintErrorMsg(
+        ui,
+        "Hack-n-Plan incoming hook could not load secrets because %s \nand.. stopped execution ¯\_(ツ)_/¯" % str(ex)
+    )
+    exit(1)
+# end try
+
+apiKey = secrets['apiKey']
+projectId = secrets['projectId']
+commentHeader = secrets['commentHeader']
+commitTableRowFormat = secrets['commitTableRowFormat']
 
 
 def ReportToHacknPlan(ui, repo, node, **kwargs):
-    global apiKey
-    global projectId
-    global commentHeader
-    global commitTableRowFormat
-    global mercurialUI
-
-    try:
-        secrets = json.load(open(secretsFilePath))
-    except (IOError, ValueError) as ex:
-        PrintErrorMsg("Hack-n-Plan incoming hook could not load secrets because %s \nand.. stopped execution ¯\_(ツ)_/¯" % str(ex))
-
-    apiKey = secrets['apiKey']
-    projectId = secrets['projectId']
-    commentHeader = secrets['commentHeader']
-    commitTableRowFormat = secrets['commitTableRowFormat']
-
-    mercurialUI = ui
     hookUserName = GetHookUserName()
     commitInfo = repo[node]
 
@@ -61,26 +63,32 @@ def EditOldComment(inCommentItem, inCommitMessages):
     taskId = inCommentItem['workItemId']
     commentId = inCommentItem['commentId']
     commentTextForSend = inCommentItem['text'] + ''.join(inCommitMessages)
-    url = 'https://api.hacknplan.com/v0/projects/%s/workitems/%s/comments/%s' % (projectId, taskId, commentId)
+    url = 'https://api.hacknplan.com/v0/projects/{project}/workitems/{task}/comments/{comment}'.format(
+        project=projectId, task=taskId, comment=commentId
+    )
     urlRequest = CreateUrlRequest(url, 'PUT')
     commentData = PrepareCommentData(commentTextForSend)
 
     try:
         urllib.request.urlopen(urlRequest, data=commentData)
     except urllib.error.URLError as ex:
-        PrintErrorMsg(("<Hack&Plan incoming hook> [%s] " % __name__) + str(ex))
+        PrintErrorMsg(ui, ("<Hack&Plan incoming hook> [%s] " % __name__) + str(ex))
+        return
 
 
 def SendNewComment(inTaskId, inCommitMessages):
-    url = 'https://api.hacknplan.com/v0/projects/%s/workitems/%s/comments/' % (projectId, inTaskId)
+    url = 'https://api.hacknplan.com/v0/projects/{project}/workitems/{task}/comments/'.format(
+        project=projectId, task=inTaskId,
+    )
     commentTextForSend = commentHeader + ''.join(inCommitMessages)
-    urlRequest = CreateUrlRequest(url, 'POST');
+    urlRequest = CreateUrlRequest(url, 'POST')
     commentData = PrepareCommentData(commentTextForSend)
 
     try:
         urllib.request.urlopen(urlRequest, data=commentData)
     except urllib.error.URLError as ex:
-        PrintErrorMsg(("<Hack&Plan incoming hook> [%s] " % __name__) + str(ex))
+        PrintErrorMsg(ui, ("<Hack&Plan incoming hook> [%s] " % __name__) + str(ex))
+        return
 
 
 ########################
@@ -99,10 +107,6 @@ def PrepareCommentData(commentText):
     return ('"%s"' % commentText).encode("utf-8")
 
 
-def PrintErrorMsg(msg):
-    mercurialUI.write((msg + "\n").encode("utf-8"))
-
-
 def GetHookUserName():
     username = None
     if os.path.exists(cacheFilePath):
@@ -116,7 +120,8 @@ def GetHookUserName():
         try:
             response = urllib.request.urlopen(urlRequest)
         except urllib.error.URLError as ex:
-            PrintErrorMsg(("<Hack&Plan incoming hook> [%s] " % __name__) + str(ex))
+            PrintErrorMsg(ui, ("<Hack&Plan incoming hook> [%s] " % __name__) + str(ex))
+            return
 
         receivedData = ResponseToJson(response)
         username = receivedData['username']
@@ -134,13 +139,17 @@ def IsOldComment(inCommentItem, inUserName):
 
 
 def GetCommentsItemsForTask(inTaskId):
-    url = 'https://api.hacknplan.com/v0/projects/%s/workitems/%s/comments' % (projectId, inTaskId)
+    url = 'https://api.hacknplan.com/v0/projects/{project}/workitems/{task}/comments'.format(
+        project=projectId, task=inTaskId,
+    )
+
     urlRequest = CreateUrlRequest(url, 'GET')
 
     try:
         response = urllib.request.urlopen(urlRequest)
     except urllib.error.URLError as ex:
-        PrintErrorMsg(("<Hack&Plan incoming hook> [%s] " % __name__) + str(ex))
+        PrintErrorMsg(ui, ("<Hack&Plan incoming hook> [%s] " % __name__) + str(ex))
+        return
 
     receivedData = ResponseToJson(response)
     return receivedData['items']
@@ -154,20 +163,11 @@ def FormatCommitMessage(inHash, inUser, inDescription):
     else:
         title = description
     title = FixDescriptionForTableRow(title)
-    return commitTableRowFormat % (inHash, inHash, inUser, title)
+    return commitTableRowFormat.format(rev=inHash, user=inUser, title=title)
 
 
 def ParseTaskIds(inText):
-    words = inText.split()
-    taskIds = []
-    for word in words:
-        taskIdWordIndex = word.find('#')
-        if taskIdWordIndex != -1:
-            word = word.replace('#', '')
-            taskId = int(word)
-            if taskId not in taskIds:
-                taskIds.append(taskId)
-    return taskIds
+    return TASK_REGEX.findall(inText)
 
 
 def FixDescriptionForTableRow(inText):
